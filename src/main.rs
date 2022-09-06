@@ -2,14 +2,25 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
+use clap::Parser;
+use http::Uri;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use hyper::{Body, Client, Method, Request, Response, Server};
 
+use pacparser::{decode_proxy, PacParser, ProxyEntry, ProxyType};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 
 type HttpClient = Client<hyper::client::HttpConnector>;
+
+#[derive(Parser)]
+struct Args {
+    #[clap(short, long)]
+    pac_file: PathBuf,
+}
 
 // To try this example:
 // 1. cargo run --example http_proxy
@@ -20,6 +31,8 @@ type HttpClient = Client<hyper::client::HttpConnector>;
 //    $ curl -i https://www.some_domain.com/
 #[tokio::main]
 async fn main() {
+    let args = Args::from_args();
+
     let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
 
     let client = Client::builder()
@@ -27,9 +40,33 @@ async fn main() {
         .http1_preserve_header_case(true)
         .build_http();
 
+    let (pac_sender, mut pac_recv): (PacSender, _) = mpsc::channel(128);
+    let local_pool = tokio_util::task::LocalPoolHandle::new(1);
+    local_pool.spawn_pinned(|| async move {
+        let mut pac_lib = PacParser::new()?;
+        let mut pac_file = pac_lib.load_path(args.pac_file)?;
+
+        while let Some((url, rsp)) = pac_recv.recv().await {
+            let proxy = pac_file.find_proxy(
+                &url.to_string(),
+                url.host().unwrap_or("NO HOST, WHAT TO DO?"),
+            )?;
+
+            let decoded = decode_proxy(proxy)?;
+            let _ = rsp.send(decoded);
+        }
+
+        Ok::<_, pacparser::Error>(())
+    });
+
     let make_service = make_service_fn(move |_| {
         let client = client.clone();
-        async move { Ok::<_, Infallible>(service_fn(move |req| proxy(client.clone(), req))) }
+        let pac_sender = pac_sender.clone();
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| {
+                proxy(client.clone(), pac_sender.clone(), req)
+            }))
+        }
     });
 
     let server = Server::bind(&addr)
@@ -44,7 +81,23 @@ async fn main() {
     }
 }
 
-async fn proxy(client: HttpClient, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+type PacSender = mpsc::Sender<(Uri, oneshot::Sender<Vec<ProxyEntry>>)>;
+
+async fn proxy(
+    client: HttpClient,
+    pac_sender: PacSender,
+    req: Request<Body>,
+) -> Result<Response<Body>, hyper::Error> {
+    let uri = req.uri().clone();
+    let (send, recv) = oneshot::channel();
+
+    pac_sender
+        .send((uri, send))
+        .await
+        .expect("PAC task errored");
+
+    let proxies = recv.await.expect("PAC task exited");
+
     if Method::CONNECT == req.method() {
         // Received an HTTP request like:
         // ```
@@ -59,28 +112,51 @@ async fn proxy(client: HttpClient, req: Request<Body>) -> Result<Response<Body>,
         // Note: only after client received an empty body with STATUS_OK can the
         // connection be upgraded, so we can't return a response inside
         // `on_upgrade` future.
-        if let Some(addr) = host_addr(req.uri()) {
-            tokio::task::spawn(async move {
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
-                        if let Err(e) = tunnel(upgraded, addr).await {
-                            eprintln!("server io error: {}", e);
-                        };
+        for entry in proxies {
+            match entry {
+                ProxyEntry::Direct => {
+                    return if let Some(addr) = host_addr(req.uri()) {
+                        tokio::task::spawn(async move {
+                            match hyper::upgrade::on(req).await {
+                                Ok(upgraded) => {
+                                    if let Err(e) = tunnel(upgraded, addr).await {
+                                        eprintln!("server io error: {}", e);
+                                    };
+                                }
+                                Err(e) => eprintln!("upgrade error: {}", e),
+                            }
+                        });
+
+                        Ok(Response::new(Body::empty()))
+                    } else {
+                        eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
+                        let mut resp =
+                            Response::new(Body::from("CONNECT must be to a socket address"));
+                        *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+
+                        Ok(Response::new(Body::empty()))
                     }
-                    Err(e) => eprintln!("upgrade error: {}", e),
                 }
-            });
-
-            Ok(Response::new(Body::empty()))
-        } else {
-            eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
-            let mut resp = Response::new(Body::from("CONNECT must be to a socket address"));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-
-            Ok(resp)
+                ProxyEntry::Proxied { ty, host, port } => match ty {
+                    ProxyType::Proxy | ProxyType::Http => todo!("proxy through {}, {}", host, port),
+                    _ => panic!("ProxyType not supported: {:?}", ty),
+                },
+            }
         }
+
+        todo!("No route found")
     } else {
-        client.request(req).await
+        for entry in proxies {
+            match entry {
+                ProxyEntry::Direct => return client.request(req).await,
+                ProxyEntry::Proxied { ty, host, port } => match ty {
+                    ProxyType::Proxy | ProxyType::Http => todo!("proxy through {}, {}", host, port),
+                    _ => panic!("ProxyType not supported: {:?}", ty),
+                },
+            }
+        }
+
+        todo!("No route, still trying direct");
     }
 }
 
