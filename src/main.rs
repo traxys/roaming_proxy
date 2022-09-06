@@ -1,14 +1,13 @@
-#![deny(warnings)]
-
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
+use color_eyre::eyre::Context;
 use http::Uri;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
-use hyper::{Body, Client, Method, Request, Response, Server};
+use hyper::{Client, Method, Request, Response, Server};
 
 use pacparser::{decode_proxy, PacParser, ProxyEntry, ProxyType};
 use tokio::net::TcpStream;
@@ -86,8 +85,8 @@ type PacSender = mpsc::Sender<(Uri, oneshot::Sender<Vec<ProxyEntry>>)>;
 async fn proxy(
     client: HttpClient,
     pac_sender: PacSender,
-    req: Request<Body>,
-) -> Result<Response<Body>, hyper::Error> {
+    req: Request<hyper::Body>,
+) -> color_eyre::Result<Response<hyper::Body>> {
     let uri = req.uri().clone();
     let (send, recv) = oneshot::channel();
 
@@ -127,18 +126,33 @@ async fn proxy(
                             }
                         });
 
-                        Ok(Response::new(Body::empty()))
+                        Ok(Response::new(hyper::Body::empty()))
                     } else {
                         eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
                         let mut resp =
-                            Response::new(Body::from("CONNECT must be to a socket address"));
+                            Response::new(hyper::Body::from("CONNECT must be to a socket address"));
                         *resp.status_mut() = http::StatusCode::BAD_REQUEST;
 
-                        Ok(Response::new(Body::empty()))
+                        Ok(Response::new(hyper::Body::empty()))
                     }
                 }
-                ProxyEntry::Proxied { ty, host, port } => match ty {
-                    ProxyType::Proxy | ProxyType::Http => todo!("proxy through {}, {}", host, port),
+                ProxyEntry::Proxied { ty, mut host, port } => match ty {
+                    ProxyType::Proxy | ProxyType::Http => {
+                        host += ":";
+                        host += &port;
+                        tokio::task::spawn(async move {
+                            match hyper::upgrade::on(req).await {
+                                Ok(upgraded) => {
+                                    if let Err(e) = tunnel(upgraded, host).await {
+                                        eprintln!("server io error: {}", e);
+                                    };
+                                }
+                                Err(e) => eprintln!("upgrade error: {}", e),
+                            }
+                        });
+
+                        return Ok(Response::new(hyper::Body::empty()));
+                    }
                     _ => panic!("ProxyType not supported: {:?}", ty),
                 },
             }
@@ -148,9 +162,23 @@ async fn proxy(
     } else {
         for entry in proxies {
             match entry {
-                ProxyEntry::Direct => return client.request(req).await,
-                ProxyEntry::Proxied { ty, host, port } => match ty {
-                    ProxyType::Proxy | ProxyType::Http => todo!("proxy through {}, {}", host, port),
+                ProxyEntry::Direct => return client.request(req).await.map_err(Into::into),
+                ProxyEntry::Proxied { ty, mut host, port } => match ty {
+                    ProxyType::Proxy | ProxyType::Http => {
+                        host += ":";
+                        host += &port;
+
+                        let distant = TcpStream::connect(&host).await?;
+                        let (mut req_sender, conn) =
+                            hyper::client::conn::handshake(distant).await?;
+
+                        tokio::spawn(async move {
+                            if let Err(e) = conn.await {
+                                eprintln!("Error in connection: {}", e);
+                            }
+                        });
+                        return req_sender.send_request(req).await.map_err(Into::into);
+                    }
                     _ => panic!("ProxyType not supported: {:?}", ty),
                 },
             }
@@ -166,12 +194,16 @@ fn host_addr(uri: &http::Uri) -> Option<String> {
 
 // Create a TCP connection to host:port, build a tunnel between the connection and
 // the upgraded connection
-async fn tunnel(mut upgraded: Upgraded, addr: String) -> std::io::Result<()> {
+async fn tunnel(mut upgraded: Upgraded, addr: String) -> color_eyre::Result<()> {
     // Connect to remote server
-    let mut server = TcpStream::connect(addr).await?;
+    let mut server = TcpStream::connect(addr)
+        .await
+        .context("could not connect to server")?;
 
     // Proxying data
-    tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
+    tokio::io::copy_bidirectional(&mut upgraded, &mut server)
+        .await
+        .context("could not copy in tunnel")?;
 
     Ok(())
 }

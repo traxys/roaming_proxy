@@ -7,9 +7,10 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.2.20", features = ["derive"] }
+color-eyre = "0.6.2"
 http = "0.2.8"
 http-body = "0.4.5"
-hyper = { version = "0.14.20", features = ["client", "server", "http1", "tcp"] }
+hyper = { version = "0.14.20", features = ["client", "server", "http1", "tcp", "stream"] }
 pacparser = { git = "http://github.com/traxys/pacparser-rs", version = "0.1.0" }
 tokio = { version = "1.21.0", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"] }
 tokio-util = { version = "0.7.3", features = ["rt"] }
