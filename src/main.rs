@@ -17,8 +17,10 @@ type HttpClient = Client<hyper::client::HttpConnector>;
 
 #[derive(Parser)]
 struct Args {
-    #[clap(short, long)]
+    #[clap(short = 'f', long)]
     pac_file: PathBuf,
+    #[clap(short, long, default_value = "8100")]
+    port: u16,
 }
 
 // To try this example:
@@ -32,7 +34,7 @@ struct Args {
 async fn main() {
     let args = Args::from_args();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8100));
+    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
 
     let client = Client::builder()
         .http1_title_case_headers(true)
