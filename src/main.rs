@@ -168,8 +168,6 @@ async fn proxy(
                 },
             }
         }
-
-        todo!("No route found")
     } else {
         for entry in proxies {
             match entry {
@@ -194,9 +192,9 @@ async fn proxy(
                 },
             }
         }
-
-        todo!("No route, still trying direct");
     }
+
+    color_eyre::eyre::bail!("Could not find a working route")
 }
 
 async fn double_tunnel(
