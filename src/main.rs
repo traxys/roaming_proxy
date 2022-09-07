@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::Context;
-use http::Uri;
+use http::{HeaderValue, StatusCode, Uri};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use hyper::{Client, Method, Request, Response, Server};
@@ -63,7 +63,16 @@ async fn main() {
         let pac_sender = pac_sender.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
-                proxy(client.clone(), pac_sender.clone(), req)
+                let client = client.clone();
+                let pac_sender = pac_sender.clone();
+                async move {
+                    proxy(client.clone(), pac_sender.clone(), req)
+                        .await
+                        .map_err(|e| {
+                            println!("Err: {:?}", e);
+                            e
+                        })
+                }
             }))
         }
     });
@@ -111,43 +120,43 @@ async fn proxy(
         // Note: only after client received an empty body with STATUS_OK can the
         // connection be upgraded, so we can't return a response inside
         // `on_upgrade` future.
+
+        let addr = match host_addr(req.uri()) {
+            Some(addr) => addr,
+            None => {
+                eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
+                let mut resp =
+                    Response::new(hyper::Body::from("CONNECT must be to a socket address"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+
+                return Ok(Response::new(hyper::Body::empty()));
+            }
+        };
+
         for entry in proxies {
             match entry {
                 ProxyEntry::Direct => {
-                    return if let Some(addr) = host_addr(req.uri()) {
-                        tokio::task::spawn(async move {
-                            match hyper::upgrade::on(req).await {
-                                Ok(upgraded) => {
-                                    if let Err(e) = tunnel(upgraded, addr).await {
-                                        eprintln!("server io error: {}", e);
-                                    };
-                                }
-                                Err(e) => eprintln!("upgrade error: {}", e),
+                    tokio::task::spawn(async move {
+                        match hyper::upgrade::on(req).await {
+                            Ok(upgraded) => {
+                                if let Err(e) = tunnel(upgraded, addr).await {
+                                    eprintln!("server io error: {}", e);
+                                };
                             }
-                        });
+                            Err(e) => eprintln!("upgrade error: {}", e),
+                        }
+                    });
 
-                        Ok(Response::new(hyper::Body::empty()))
-                    } else {
-                        eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
-                        let mut resp =
-                            Response::new(hyper::Body::from("CONNECT must be to a socket address"));
-                        *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-
-                        Ok(Response::new(hyper::Body::empty()))
-                    }
+                    return Ok(Response::new(hyper::Body::empty()));
                 }
                 ProxyEntry::Proxied { ty, mut host, port } => match ty {
                     ProxyType::Proxy | ProxyType::Http => {
                         host += ":";
                         host += &port;
-                        tokio::task::spawn(async move {
-                            match hyper::upgrade::on(req).await {
-                                Ok(upgraded) => {
-                                    if let Err(e) = tunnel(upgraded, host).await {
-                                        eprintln!("server io error: {}", e);
-                                    };
-                                }
-                                Err(e) => eprintln!("upgrade error: {}", e),
+
+                        tokio::spawn(async {
+                            if let Err(e) = double_tunnel(req, addr, host).await {
+                                println!("Double tunnel errored: {:?}", e)
                             }
                         });
 
@@ -186,6 +195,48 @@ async fn proxy(
 
         todo!("No route, still trying direct");
     }
+}
+
+async fn double_tunnel(
+    req: Request<hyper::Body>,
+    addr: String,
+    host: String,
+) -> color_eyre::Result<()> {
+    let distant_connect = Request::connect(req.uri())
+        .header("host", addr)
+        .header(
+            "user-agent",
+            req.headers()
+                .get("user-agent")
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_str("pac_proxy").unwrap()),
+        )
+        .header("proxy-connection", "Keep-Alive")
+        .body(hyper::Body::empty())?;
+
+    let distant = TcpStream::connect(&host).await?;
+
+    let (mut req_sender, conn) = hyper::client::conn::handshake(distant).await?;
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            println!("Connection failed: {e:?}");
+        }
+    });
+
+    let response = req_sender.send_request(distant_connect).await?;
+    if response.status() != StatusCode::OK {
+        color_eyre::eyre::bail!("Server did not accept to connect: {:?}", response)
+    };
+
+    let mut upgraded_to_proxy = hyper::upgrade::on(response).await?;
+    let mut upgraded_client = hyper::upgrade::on(req).await?;
+
+    tokio::io::copy_bidirectional(&mut upgraded_to_proxy, &mut upgraded_client)
+        .await
+        .context("could not copy in tunnel")?;
+
+    Ok(())
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
