@@ -4,14 +4,15 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::Context;
-use http::{HeaderValue, StatusCode, Uri};
+use http::{HeaderValue, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use hyper::{Client, Method, Request, Response, Server};
 
-use pacparser::{decode_proxy, PacParser, ProxyEntry, ProxyType};
+use pacparser::{PacParser, ProxyEntry, ProxyType};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use url::Url;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -23,6 +24,22 @@ struct Args {
     port: u16,
 }
 
+async fn pac_task(
+    file: String,
+    mut rx: mpsc::Receiver<(Url, oneshot::Sender<Vec<ProxyEntry>>)>,
+) -> color_eyre::Result<()> {
+    let mut pac_lib = PacParser::new()?;
+    let mut pac_file = pac_lib.load(&file)?;
+
+    while let Some((url, rsp)) = rx.recv().await {
+        let proxy = pac_file.find_proxy(&url)?;
+
+        let _ = rsp.send(proxy);
+    }
+
+    Ok(())
+}
+
 // To try this example:
 // 1. cargo run --example http_proxy
 // 2. config http_proxy in command line
@@ -31,7 +48,8 @@ struct Args {
 // 3. send requests
 //    $ curl -i https://www.some_domain.com/
 #[tokio::main]
-async fn main() {
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
     let args = Args::from_args();
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -41,23 +59,14 @@ async fn main() {
         .http1_preserve_header_case(true)
         .build_http();
 
-    let (pac_sender, mut pac_recv): (PacSender, _) = mpsc::channel(128);
+    let pac_file = std::fs::read_to_string(args.pac_file)?;
+
+    let (pac_sender, pac_recv): (PacSender, _) = mpsc::channel(128);
     let local_pool = tokio_util::task::LocalPoolHandle::new(1);
     local_pool.spawn_pinned(|| async move {
-        let mut pac_lib = PacParser::new()?;
-        let mut pac_file = pac_lib.load_path(args.pac_file)?;
-
-        while let Some((url, rsp)) = pac_recv.recv().await {
-            let proxy = pac_file.find_proxy(
-                &url.to_string(),
-                url.host().unwrap_or("NO HOST, WHAT TO DO?"),
-            )?;
-
-            let decoded = decode_proxy(proxy)?;
-            let _ = rsp.send(decoded);
-        }
-
-        Ok::<_, pacparser::Error>(())
+        if let Err(e) = pac_task(pac_file, pac_recv).await {
+            println!("PAC error: {:?}", e);
+        };
     });
 
     let make_service = make_service_fn(move |_| {
@@ -86,12 +95,10 @@ async fn main() {
 
     println!("Listening on http://{}", addr);
 
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
-    }
+    Ok(server.await?)
 }
 
-type PacSender = mpsc::Sender<(Uri, oneshot::Sender<Vec<ProxyEntry>>)>;
+type PacSender = mpsc::Sender<(Url, oneshot::Sender<Vec<ProxyEntry>>)>;
 
 async fn proxy(
     client: HttpClient,
@@ -101,8 +108,12 @@ async fn proxy(
     let uri = req.uri().clone();
     let (send, recv) = oneshot::channel();
 
+    let url = format!("http://{uri}")
+        .parse()
+        .context("URI was not an URL")?;
+
     pac_sender
-        .send((uri, send))
+        .send((url, send))
         .await
         .expect("PAC task errored");
 

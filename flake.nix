@@ -27,8 +27,6 @@
 
       defaultPackage = naersk'.buildPackage {
         src = ./.;
-        gitSubmodules = true;
-        buildInputs = [pkgs.rustPlatform.bindgenHook];
       };
     });
 }
