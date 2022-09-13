@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use color_eyre::eyre::Context;
+use http::uri::Port;
 use http::{HeaderValue, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
@@ -105,12 +106,18 @@ async fn proxy(
     pac_sender: PacSender,
     req: Request<hyper::Body>,
 ) -> color_eyre::Result<Response<hyper::Body>> {
-    let uri = req.uri().clone();
+    let uri = req.uri();
     let (send, recv) = oneshot::channel();
 
-    let url = format!("http://{uri}")
-        .parse()
-        .context("URI was not an URL")?;
+    let url = if let Some("443") = uri.port().as_ref().map(|p| p.as_str()) {
+        format!("https://{uri}")
+            .parse()
+            .context("URI was not an URL")?
+    } else {
+        format!("http://{uri}")
+            .parse()
+            .context("URI was not an URL")?
+    };
 
     pac_sender
         .send((url, send))
