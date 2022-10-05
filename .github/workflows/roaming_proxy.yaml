@@ -1,0 +1,27 @@
+name: Roaming proxy build
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    name: Build Proxy
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64_uknown-linux-musl
+            bin: target/release/roaming_proxy
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: target/relase/roaming_proxy.exe
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build

@@ -16,14 +16,35 @@
 
         overlays = [(import pacparser.inputs.rust-overlay)];
       };
-      rust = pkgs.rust-bin.stable.latest.default;
+
+      rust = pkgs.rust-bin.stable.latest.default.override {
+        targets = ["x86_64-pc-windows-gnu"];
+      };
 
       naersk' = pkgs.callPackage naersk {
         cargo = rust;
         rustc = rust;
       };
     in {
-      devShell = pacparser.devShell."${system}";
+      devShell = pkgs.mkShell {
+        nativeBuildInputs = with pkgs; [
+          pkgsCross.mingwW64.stdenv.cc
+          pkgsCross.mingwW64.windows.pthreads
+          rust
+        ];
+      };
+
+      packages.x86_64-pc-windows-gnu = naersk'.buildPackage {
+        src = ./.;
+        strictDeps = true;
+
+        depsBuildBuild = with pkgs; [
+          pkgsCross.mingwW64.stdenv.cc
+          pkgsCross.mingwW64.windows.pthreads
+        ];
+
+        CARGO_BUILD_TARGET = "x86_64-pc-windows-gnu";
+      };
 
       defaultPackage = naersk'.buildPackage {
         src = ./.;

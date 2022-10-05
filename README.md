@@ -1,10 +1,5 @@
-# pac_proxy
+# Roaming Proxy
 
-Few non browser based applications support PAC files in order to choose proxy.
-This can be problematic in corporate environnements with roaming devices, because the proxies won't always be correct.
+This proxy is useful when you have a roaming laptop and some locations require http proxies, other don't.
 
-This is an HTTP proxy that chooses the correct distant host (either another Proxy or a Direct connection) according to the PAC file.
-
-## Usage
-
-Download a PAC file and run the proxy with `-f <pac_file>`.
+You can choose different proxies according to the IPv4/IPv6 subnetwork you are currently in.

@@ -1,44 +1,32 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use color_eyre::eyre::Context;
-use http::uri::Port;
 use http::{HeaderValue, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use hyper::{Client, Method, Request, Response, Server};
-
-use pacparser::{PacParser, ProxyEntry, ProxyType};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
-use url::Url;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
-#[derive(Parser)]
-struct Args {
-    #[clap(short = 'f', long)]
-    pac_file: PathBuf,
-    #[clap(short, long, default_value = "8100")]
-    port: u16,
+#[derive(Serialize, Deserialize)]
+struct Config {
+    v4: HashMap<ipnet::Ipv4Net, String>,
+    v6: HashMap<ipnet::Ipv6Net, String>,
 }
 
-async fn pac_task(
-    file: String,
-    mut rx: mpsc::Receiver<(Url, oneshot::Sender<Vec<ProxyEntry>>)>,
-) -> color_eyre::Result<()> {
-    let mut pac_lib = PacParser::new()?;
-    let mut pac_file = pac_lib.load(&file)?;
-
-    while let Some((url, rsp)) = rx.recv().await {
-        let proxy = pac_file.find_proxy(&url)?;
-
-        let _ = rsp.send(proxy);
-    }
-
-    Ok(())
+#[derive(Parser)]
+struct Args {
+    #[clap(short, long)]
+    config: PathBuf,
+    #[clap(short, long, default_value = "8100")]
+    port: u16,
 }
 
 // To try this example:
@@ -60,30 +48,21 @@ async fn main() -> color_eyre::Result<()> {
         .http1_preserve_header_case(true)
         .build_http();
 
-    let pac_file = std::fs::read_to_string(args.pac_file)?;
-
-    let (pac_sender, pac_recv): (PacSender, _) = mpsc::channel(128);
-    let local_pool = tokio_util::task::LocalPoolHandle::new(1);
-    local_pool.spawn_pinned(|| async move {
-        if let Err(e) = pac_task(pac_file, pac_recv).await {
-            println!("PAC error: {:?}", e);
-        };
-    });
+    let config: Config = toml::from_str(&std::fs::read_to_string(args.config)?)?;
+    let config = Arc::new(config);
 
     let make_service = make_service_fn(move |_| {
         let client = client.clone();
-        let pac_sender = pac_sender.clone();
+        let config = config.clone();
         async move {
             Ok::<_, Infallible>(service_fn(move |req| {
                 let client = client.clone();
-                let pac_sender = pac_sender.clone();
+                let config = config.clone();
                 async move {
-                    proxy(client.clone(), pac_sender.clone(), req)
-                        .await
-                        .map_err(|e| {
-                            println!("Err: {:?}", e);
-                            e
-                        })
+                    proxy(client, config, req).await.map_err(|e| {
+                        println!("Err: {:?}", e);
+                        e
+                    })
                 }
             }))
         }
@@ -99,32 +78,27 @@ async fn main() -> color_eyre::Result<()> {
     Ok(server.await?)
 }
 
-type PacSender = mpsc::Sender<(Url, oneshot::Sender<Vec<ProxyEntry>>)>;
-
 async fn proxy(
     client: HttpClient,
-    pac_sender: PacSender,
+    config: Arc<Config>,
     req: Request<hyper::Body>,
 ) -> color_eyre::Result<Response<hyper::Body>> {
-    let uri = req.uri();
-    let (send, recv) = oneshot::channel();
+    let ip = local_ip_address::local_ip()?;
 
-    let url = if let Some("443") = uri.port().as_ref().map(|p| p.as_str()) {
-        format!("https://{uri}")
-            .parse()
-            .context("URI was not an URL")?
-    } else {
-        format!("http://{uri}")
-            .parse()
-            .context("URI was not an URL")?
+    let proxy = match ip {
+        IpAddr::V4(addr) => config
+            .v4
+            .iter()
+            .find(|(net, _)| net.contains(&addr))
+            .map(|(_, host)| host)
+            .cloned(),
+        IpAddr::V6(addr) => config
+            .v6
+            .iter()
+            .find(|(net, _)| net.contains(&addr))
+            .map(|(_, host)| host)
+            .cloned(),
     };
-
-    pac_sender
-        .send((url, send))
-        .await
-        .expect("PAC task errored");
-
-    let proxies = recv.await.expect("PAC task exited");
 
     if Method::CONNECT == req.method() {
         // Received an HTTP request like:
@@ -153,66 +127,47 @@ async fn proxy(
             }
         };
 
-        for entry in proxies {
-            match entry {
-                ProxyEntry::Direct => {
-                    tokio::task::spawn(async move {
-                        match hyper::upgrade::on(req).await {
-                            Ok(upgraded) => {
-                                if let Err(e) = tunnel(upgraded, addr).await {
-                                    eprintln!("server io error: {}", e);
-                                };
-                            }
-                            Err(e) => eprintln!("upgrade error: {}", e),
+        match proxy {
+            None => {
+                tokio::task::spawn(async move {
+                    match hyper::upgrade::on(req).await {
+                        Ok(upgraded) => {
+                            if let Err(e) = tunnel(upgraded, addr).await {
+                                eprintln!("server io error: {}", e);
+                            };
                         }
-                    });
-
-                    return Ok(Response::new(hyper::Body::empty()));
-                }
-                ProxyEntry::Proxied { ty, mut host, port } => match ty {
-                    ProxyType::Proxy | ProxyType::Http => {
-                        host += ":";
-                        host += &port;
-
-                        tokio::spawn(async {
-                            if let Err(e) = double_tunnel(req, addr, host).await {
-                                println!("Double tunnel errored: {:?}", e)
-                            }
-                        });
-
-                        return Ok(Response::new(hyper::Body::empty()));
+                        Err(e) => eprintln!("upgrade error: {}", e),
                     }
-                    _ => panic!("ProxyType not supported: {:?}", ty),
-                },
+                });
+
+                Ok(Response::new(hyper::Body::empty()))
+            }
+            Some(host) => {
+                tokio::spawn(async {
+                    if let Err(e) = double_tunnel(req, addr, host).await {
+                        println!("Double tunnel errored: {:?}", e)
+                    }
+                });
+
+                Ok(Response::new(hyper::Body::empty()))
             }
         }
     } else {
-        for entry in proxies {
-            match entry {
-                ProxyEntry::Direct => return client.request(req).await.map_err(Into::into),
-                ProxyEntry::Proxied { ty, mut host, port } => match ty {
-                    ProxyType::Proxy | ProxyType::Http => {
-                        host += ":";
-                        host += &port;
+        match proxy {
+            None => client.request(req).await.map_err(Into::into),
+            Some(host) => {
+                let distant = TcpStream::connect(&host).await?;
+                let (mut req_sender, conn) = hyper::client::conn::handshake(distant).await?;
 
-                        let distant = TcpStream::connect(&host).await?;
-                        let (mut req_sender, conn) =
-                            hyper::client::conn::handshake(distant).await?;
-
-                        tokio::spawn(async move {
-                            if let Err(e) = conn.await {
-                                eprintln!("Error in connection: {}", e);
-                            }
-                        });
-                        return req_sender.send_request(req).await.map_err(Into::into);
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        eprintln!("Error in connection: {}", e);
                     }
-                    _ => panic!("ProxyType not supported: {:?}", ty),
-                },
+                });
+                req_sender.send_request(req).await.map_err(Into::into)
             }
         }
     }
-
-    color_eyre::eyre::bail!("Could not find a working route")
 }
 
 async fn double_tunnel(
@@ -232,7 +187,9 @@ async fn double_tunnel(
         .header("proxy-connection", "Keep-Alive")
         .body(hyper::Body::empty())?;
 
-    let distant = TcpStream::connect(&host).await?;
+    let distant = TcpStream::connect(&host)
+        .await
+        .with_context(|| format!("Could not connect to distant {host}"))?;
 
     let (mut req_sender, conn) = hyper::client::conn::handshake(distant).await?;
 
