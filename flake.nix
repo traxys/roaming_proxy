@@ -1,20 +1,22 @@
 {
   description = "A basic flake with a shell";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   inputs.flake-utils.url = "github:numtide/flake-utils";
-  inputs.pacparser.url = "github:traxys/pacparser-rs";
   inputs.naersk.url = "github:nix-community/naersk";
+  inputs.rust-overlay.url = "github:oxalica/rust-overlay";
 
   outputs = {
     self,
+    nixpkgs,
     flake-utils,
-    pacparser,
     naersk,
+    rust-overlay,
   }:
     flake-utils.lib.eachDefaultSystem (system: let
-      pkgs = import pacparser.inputs.nixpkgs {
+      pkgs = import nixpkgs {
         inherit system;
 
-        overlays = [(import pacparser.inputs.rust-overlay)];
+        overlays = [(import rust-overlay)];
       };
 
       rust = pkgs.rust-bin.stable.latest.default.override {
